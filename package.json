@@ -1,0 +1,20 @@
+{
+  "name": "subway-sim",
+  "version": "1.0.0",
+  "description": "Mobile network simulator for Windows and MacOS",
+  "bin": {
+    "subway-sim": "./bin/index.js"
+  },
+  "scripts": {
+    "postinstall": "node ./scripts/install.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YOUR_USERNAME/subway-sim.git"
+  },
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.4.0"
+  }
+}
