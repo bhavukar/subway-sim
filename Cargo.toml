@@ -1,0 +1,19 @@
+[package]
+name = "subway-sim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# CLI Parsing
+clap = { version = "4.4", features = ["derive"] }
+# Windows Packet Interception
+windivert = "0.6.0"
+# Async Runtime
+tokio = { version = "1.35", features = ["full"] }
+# Randomization for packet drops
+rand = "0.8.5"
+# Terminal UI
+ratatui = "0.26.0"
+crossterm = "0.27.0"
+# Error handling
+anyhow = "1.0.75"
