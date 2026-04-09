@@ -7,7 +7,7 @@ edition = "2021"
 # CLI Parsing
 clap = { version = "4.4", features = ["derive"] }
 # Windows Packet Interception
-windivert = "0.6.0"
+windivert = { version = "0.6.0", features = ["vendored"] }
 # Async Runtime
 tokio = { version = "1.35", features = ["full"] }
 # Randomization for packet drops

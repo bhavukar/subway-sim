@@ -22,11 +22,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::time::sleep;
-use windivert::{WinDivert, WinDivertFlags, WinDivertLayer};
+use windivert::prelude::*;
 
-/// CLI Definitions
 #[derive(Parser)]
-#[command(name = "subway-sim", version = "1.0", about = "Network Throttler for Mobile Emulators")]
+#[command(name = "subway-sim", version = "1.0", about = "Mobile Network Simulator")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -34,28 +33,34 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start simulating a network environment
     Start {
-        #[arg(short, long, default_value_t = 8080)]
-        port: u16,
-        #[arg(short, long, default_value_t = 0)]
-        latency: u64,
-        #[arg(short, long, default_value_t = 0)]
-        drop_rate: u8,
-        #[arg(long)]
-        profile: Option<String>,
+        /// The port to throttle (default: targets 8080, 3000, 8000, 5000)
+        #[arg(short, long)]
+        port: Option<u16>,
+        
+        /// Predefined environment: subway, elevator, mountain, 3g
+        #[arg(short, long, default_value = "subway")]
+        profile: String,
+
+        /// Custom latency in ms (overrides profile)
+        #[arg(short, long)]
+        latency: Option<u64>,
+
+        /// Custom drop rate % (overrides profile)
+        #[arg(short, long)]
+        drop: Option<u8>,
     },
 }
 
-/// Shared State for the TUI
 struct AppState {
     intercepted: AtomicU64,
     dropped: AtomicU64,
     delayed: AtomicU64,
     throughput_history: std::sync::Mutex<Vec<u64>>,
-    active_profile: String,
-    config_latency: u64,
-    config_drop: u8,
-    config_port: u16,
+    profile_name: String,
+    latency: u64,
+    drop_rate: u8,
 }
 
 #[tokio::main]
@@ -63,175 +68,132 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { port, mut latency, mut drop_rate, profile } => {
-            // Profile Overrides
-            let mut profile_name = "Custom".to_string();
-            if let Some(p) = profile {
-                match p.to_lowercase().as_str() {
-                    "elevator" => { latency = 2000; drop_rate = 15; profile_name = "Elevator".into(); }
-                    "3g" => { latency = 500; drop_rate = 2; profile_name = "3G Network".into(); }
-                    _ => { profile_name = format!("Custom: {}", p); }
-                }
-            }
+        Commands::Start { port, profile, latency, drop } => {
+            let (p_name, p_lat, p_drop) = match profile.to_lowercase().as_str() {
+                "subway" => ("Subway (Spotty)", 800, 10),
+                "elevator" => ("Elevator (Dead Zone)", 2500, 20),
+                "mountain" => ("Mountain (High Latency)", 4000, 5),
+                "3g" => ("3G Network", 400, 2),
+                _ => ("Custom", 0, 0),
+            };
+
+            let final_lat = latency.unwrap_or(p_lat);
+            let final_drop = drop.unwrap_or(p_drop);
 
             let state = Arc::new(AppState {
                 intercepted: AtomicU64::new(0),
                 dropped: AtomicU64::new(0),
                 delayed: AtomicU64::new(0),
                 throughput_history: std::sync::Mutex::new(vec![0; 100]),
-                active_profile: profile_name,
-                config_latency: latency,
-                config_drop: drop_rate,
-                config_port: port,
+                profile_name: p_name.to_string(),
+                latency: final_lat,
+                drop_rate: final_drop,
             });
 
-            run_app(port, state).await?;
+            // If no port provided, we throttle the "Big 4" dev ports
+            let ports = if let Some(p) = port { vec![p] } else { vec![8080, 3000, 8000, 5000] };
+            
+            run_app(ports, state).await?;
         }
     }
     Ok(())
 }
 
-async fn run_app(port: u16, state: Arc<AppState>) -> Result<()> {
-    // TUI Setup
+async fn run_app(ports: Vec<u16>, state: Arc<AppState>) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Start Packet Engine
-    let engine_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        if let Err(e) = packet_engine(port, engine_state).await {
-            // Note: In a TUI, we can't easily print to stderr without ruining the layout
-            // For now, we'll just log it mentally, but in production we'd use a log file.
-        }
-    });
+    for &port in &ports {
+        let engine_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let _ = packet_engine(port, engine_state).await;
+        });
+    }
 
-    // TUI Loop
-    let tick_rate = Duration::from_millis(200);
     let mut last_tick = Instant::now();
-
     loop {
-        terminal.draw(|f| ui(f, &state))?;
-
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or_else(|| Duration::from_secs(0));
-
-        if event::poll(timeout)? {
+        terminal.draw(|f| ui(f, &state, &ports))?;
+        if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
-                if let KeyCode::Char('q') = key.code {
-                    break;
-                }
+                if let KeyCode::Char('q') = key.code { break; }
             }
         }
-
-        if last_tick.elapsed() >= tick_rate {
-            // Update throughput "vibe"
+        if last_tick.elapsed() >= Duration::from_millis(200) {
             let mut history = state.throughput_history.lock().unwrap();
             let current = state.intercepted.load(Ordering::Relaxed);
-            history.push(current % 50); // Simulated "health" wave
+            history.push(current % 50);
             if history.len() > 100 { history.remove(0); }
             last_tick = Instant::now();
         }
     }
 
-    // Cleanup
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     Ok(())
 }
 
 async fn packet_engine(port: u16, state: Arc<AppState>) -> Result<()> {
-    /* 
-       WinDivert Filter String:
-       - 'tcp' or 'udp' filters the protocol.
-       - 'local_port' and 'remote_port' capture both inbound/outbound legs.
-       - '!(loopback)' ensures we don't accidentally capture internal noise.
-    */
-    let filter = format!(
-        "(tcp or udp) and (local_port == {} or remote_port == {})",
-        port
-    );
-
-    // Open WinDivert handle (Requires Admin)
-    let diverter = WinDivert::new(&filter, WinDivertLayer::Network, 0, WinDivertFlags::default())
-        .map_err(|e| anyhow::anyhow!("Failed to open WinDivert: {}. Ensure you are Admin.", e))?;
-    
+    let filter = format!("(tcp or udp) and (local_port == {} or remote_port == {})", port, port);
+    let diverter = WinDivert::<NetworkLayer>::network(&filter, 0, WinDivertFlags::default())?;
     let diverter = Arc::new(diverter);
 
     loop {
-        // Receive a packet from the driver
-        let packet = diverter.recv().map_err(|e| anyhow::anyhow!("Recv error: {}", e))?;
+        let packet = diverter.recv(None)?;
         state.intercepted.fetch_add(1, Ordering::Relaxed);
-
         let d_clone = Arc::clone(&diverter);
         let s_clone = Arc::clone(&state);
 
-        // Process each packet in a non-blocking task
         tokio::spawn(async move {
-            let mut rng = rand::thread_rng();
+            let should_drop = {
+                let mut rng = rand::thread_rng();
+                rng.gen_range(0..100) < s_clone.drop_rate
+            };
 
-            // 1. Drop Check
-            if rng.gen_range(0..100) < s_clone.config_drop {
+            if should_drop {
                 s_clone.dropped.fetch_add(1, Ordering::Relaxed);
-                return; // Packet is never re-injected, effectively dropping it
+                return;
             }
 
-            // 2. Latency Injection
-            if s_clone.config_latency > 0 {
+            if s_clone.latency > 0 {
                 s_clone.delayed.fetch_add(1, Ordering::Relaxed);
-                sleep(Duration::from_millis(s_clone.config_latency)).await;
+                sleep(Duration::from_millis(s_clone.latency)).await;
             }
-
-            /* 
-               3. Re-injection:
-               WinDivert uses the packet's 'address' metadata to understand its flow.
-               Re-injecting it sends it back to the network stack to proceed to its target.
-            */
-            if let Err(e) = d_clone.send(&packet) {
-                // Silently ignore send errors for now
-            }
+            let _ = d_clone.send(&packet);
         });
     }
 }
 
-fn ui(f: &mut ratatui::Frame, state: &AppState) {
+fn ui(f: &mut ratatui::Frame, state: &AppState, ports: &[u16]) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(6),
-            Constraint::Min(0),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Length(8), Constraint::Min(0)])
         .split(f.size());
 
-    // Header
     let header = Paragraph::new(format!(
-        " SUBWAY-SIM | Profile: {} | Port: {} | Latency: {}ms | Drop: {}% | (Press 'q' to quit)",
-        state.active_profile, state.config_port, state.config_latency, state.config_drop
+        " 🚇 SUBWAY-SIM | Profile: {} | Latency: {}ms | Drop: {}% ",
+        state.profile_name, state.latency, state.drop_rate
     ))
-    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-    .block(Block::default().borders(Borders::ALL));
+    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    .block(Block::default().borders(Borders::ALL).title(" Status "));
     f.render_widget(header, chunks[0]);
 
-    // Stats
-    let stats_text = format!(
-        "\n  Intercepted: {}\n  Dropped:     {}\n  Delayed:     {}",
+    let ports_str = ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
+    let stats = Paragraph::new(format!(
+        "\n  Monitoring Ports: [{}]\n\n  Packets Caught:  {}\n  Packets Dropped: {}\n  Packets Delayed: {}",
+        ports_str,
         state.intercepted.load(Ordering::Relaxed),
         state.dropped.load(Ordering::Relaxed),
         state.delayed.load(Ordering::Relaxed)
-    );
-    let stats = Paragraph::new(stats_text)
-        .block(Block::default().title(" Live Counters ").borders(Borders::ALL));
+    )).block(Block::default().title(" Live Simulation ").borders(Borders::ALL));
     f.render_widget(stats, chunks[1]);
 
-    // Throughput Sparkline
     let history = state.throughput_history.lock().unwrap();
     let sparkline = Sparkline::default()
-        .block(Block::default().title(" Network Throughput / Health ").borders(Borders::ALL))
+        .block(Block::default().title(" Network Stability ").borders(Borders::ALL))
         .data(&history)
         .style(Style::default().fg(Color::Green));
     f.render_widget(sparkline, chunks[2]);
