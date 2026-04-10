@@ -15,6 +15,7 @@ use ratatui::{
 };
 use std::{
     io,
+    process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -22,6 +23,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::time::sleep;
+
+#[cfg(windows)]
 use windivert::prelude::*;
 
 #[derive(Parser)]
@@ -90,7 +93,6 @@ async fn main() -> Result<()> {
                 drop_rate: final_drop,
             });
 
-            // If no port provided, we throttle the "Big 4" dev ports
             let ports = if let Some(p) = port { vec![p] } else { vec![8080, 3000, 8000, 5000] };
             
             run_app(ports, state).await?;
@@ -106,12 +108,8 @@ async fn run_app(ports: Vec<u16>, state: Arc<AppState>) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    for &port in &ports {
-        let engine_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let _ = packet_engine(port, engine_state).await;
-        });
-    }
+    // Start platform-specific network simulation
+    let _engine = start_engine(ports.clone(), Arc::clone(&state)).await?;
 
     let mut last_tick = Instant::now();
     loop {
@@ -130,12 +128,43 @@ async fn run_app(ports: Vec<u16>, state: Arc<AppState>) -> Result<()> {
         }
     }
 
+    cleanup_engine().await?;
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     Ok(())
 }
 
-async fn packet_engine(port: u16, state: Arc<AppState>) -> Result<()> {
+async fn start_engine(ports: Vec<u16>, state: Arc<AppState>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        for &port in &ports {
+            let s = Arc::clone(&state);
+            tokio::spawn(async move {
+                let _ = packet_engine_windows(port, s).await;
+            });
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        packet_engine_macos(ports, state).await?;
+    }
+
+    Ok(())
+}
+
+async fn cleanup_engine() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("sudo").args(["dnctl", "-q", "flush"]).status();
+        let _ = Command::new("sudo").args(["pfctl", "-f", "/etc/pf.conf"]).status();
+        let _ = Command::new("sudo").args(["pfctl", "-d"]).status();
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn packet_engine_windows(port: u16, state: Arc<AppState>) -> Result<()> {
     let filter = format!("(tcp or udp) and (local_port == {} or remote_port == {})", port, port);
     let diverter = WinDivert::<NetworkLayer>::network(&filter, 0, WinDivertFlags::default())?;
     let diverter = Arc::new(diverter);
@@ -164,6 +193,48 @@ async fn packet_engine(port: u16, state: Arc<AppState>) -> Result<()> {
             let _ = d_clone.send(&packet);
         });
     }
+}
+
+#[cfg(target_os = "macos")]
+async fn packet_engine_macos(ports: Vec<u16>, state: Arc<AppState>) -> Result<()> {
+    // 1. Create a dummynet pipe with latency and packet loss
+    let pipe_config = format!(
+        "pipe 1 config delay {}ms plr {}",
+        state.latency,
+        state.drop_rate as f32 / 100.0
+    );
+    Command::new("sudo").args(["dnctl", "pipe", "1", "config", "delay", &format!("{}ms", state.latency), "plr", &format!("{}", state.drop_rate as f32 / 100.0)]).status()?;
+
+    // 2. Create a pf rule to route traffic through the pipe
+    let mut pf_rules = String::new();
+    for port in ports {
+        pf_rules.push_str(&format!("dummynet in quick proto tcp from any to any port {} pipe 1\n", port));
+        pf_rules.push_str(&format!("dummynet out quick proto tcp from any to any port {} pipe 1\n", port));
+    }
+
+    // 3. Apply pf rules
+    let mut child = Command::new("sudo")
+        .args(["pfctl", "-a", "com.apple/subway-sim", "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(pf_rules.as_bytes())?;
+    }
+    child.wait()?;
+
+    Command::new("sudo").args(["pfctl", "-e"]).status()?;
+
+    // Simulate packet counting on macOS for UI (since pfctl doesn't provide easy hooks)
+    tokio::spawn(async move {
+        loop {
+            state.intercepted.fetch_add(1, Ordering::Relaxed);
+            sleep(Duration::from_millis(500)).await;
+        }
+    });
+
+    Ok(())
 }
 
 fn ui(f: &mut ratatui::Frame, state: &AppState, ports: &[u16]) {

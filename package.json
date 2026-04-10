@@ -1,20 +1,39 @@
 {
   "name": "subway-sim",
-  "version": "1.0.0",
-  "description": "Mobile network simulator for Windows and MacOS",
+  "version": "0.1.0",
+  "description": "Cross-platform Mobile Network Simulator (Windows & macOS)",
+  "main": "bin/index.js",
   "bin": {
-    "subway-sim": "./bin/index.js"
+    "subway-sim": "bin/index.js"
   },
-  "scripts": {
-    "postinstall": "node ./scripts/install.js"
-  },
+  "files": [
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bhavukar/subway-sim.git"
+    "url": "git+https://github.com/your-username/subway-sim.git"
   },
-  "author": "Your Name",
+  "keywords": [
+    "network",
+    "simulator",
+    "windivert",
+    "pfctl",
+    "rust",
+    "latency",
+    "packet-loss",
+    "macos",
+    "windows"
+  ],
+  "author": "",
   "license": "MIT",
-  "dependencies": {
-    "axios": "^1.4.0"
-  }
+  "os": [
+    "win32",
+    "darwin"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
 }
