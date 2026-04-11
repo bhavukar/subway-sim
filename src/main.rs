@@ -5,6 +5,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+#[cfg(windows)]
 use rand::Rng;
 use ratatui::{
     backend::CrosstermBackend,
@@ -157,8 +158,8 @@ async fn cleanup_engine() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let _ = Command::new("sudo").args(["dnctl", "-q", "flush"]).status();
-        let _ = Command::new("sudo").args(["pfctl", "-f", "/etc/pf.conf"]).status();
-        let _ = Command::new("sudo").args(["pfctl", "-d"]).status();
+        let _ = Command::new("sudo").args(["pfctl", "-a", "com.apple/subway-sim", "-F", "all"]).status();
+        let _ = Command::new("sudo").args(["pfctl", "-X"]).status();
     }
     Ok(())
 }
@@ -198,21 +199,29 @@ async fn packet_engine_windows(port: u16, state: Arc<AppState>) -> Result<()> {
 #[cfg(target_os = "macos")]
 async fn packet_engine_macos(ports: Vec<u16>, state: Arc<AppState>) -> Result<()> {
     // 1. Create a dummynet pipe with latency and packet loss
-    let pipe_config = format!(
-        "pipe 1 config delay {}ms plr {}",
-        state.latency,
-        state.drop_rate as f32 / 100.0
-    );
-    Command::new("sudo").args(["dnctl", "pipe", "1", "config", "delay", &format!("{}ms", state.latency), "plr", &format!("{}", state.drop_rate as f32 / 100.0)]).status()?;
+    let _ = Command::new("sudo").args(["dnctl", "-q", "flush"]).status();
+    
+    let status = Command::new("sudo")
+        .args([
+            "dnctl", 
+            "pipe", "1", "config", 
+            "delay", &format!("{}ms", state.latency), 
+            "plr", &format!("{:.3}", state.drop_rate as f32 / 100.0)
+        ])
+        .status()?;
+    
+    if !status.success() {
+        return Err(anyhow::anyhow!("Failed to configure dnctl pipe"));
+    }
 
     // 2. Create a pf rule to route traffic through the pipe
     let mut pf_rules = String::new();
     for port in ports {
-        pf_rules.push_str(&format!("dummynet in quick proto tcp from any to any port {} pipe 1\n", port));
-        pf_rules.push_str(&format!("dummynet out quick proto tcp from any to any port {} pipe 1\n", port));
+        pf_rules.push_str(&format!("dummynet in quick proto {{tcp, udp}} from any to any port {} pipe 1\n", port));
+        pf_rules.push_str(&format!("dummynet out quick proto {{tcp, udp}} from any to any port {} pipe 1\n", port));
     }
 
-    // 3. Apply pf rules
+    // 3. Apply pf rules to the subway-sim anchor
     let mut child = Command::new("sudo")
         .args(["pfctl", "-a", "com.apple/subway-sim", "-f", "-"])
         .stdin(std::process::Stdio::piped())
@@ -222,9 +231,17 @@ async fn packet_engine_macos(ports: Vec<u16>, state: Arc<AppState>) -> Result<()
         use std::io::Write;
         stdin.write_all(pf_rules.as_bytes())?;
     }
-    child.wait()?;
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("Failed to apply pf rules"));
+    }
 
-    Command::new("sudo").args(["pfctl", "-e"]).status()?;
+    // 4. Enable PF (using -E to increment reference count)
+    let status = Command::new("sudo").args(["pfctl", "-E"]).status()?;
+    if !status.success() {
+        // -E might fail if already enabled in some contexts, but usually it returns success and says "already enabled"
+        // Let's just log it if it fails.
+    }
 
     // Simulate packet counting on macOS for UI (since pfctl doesn't provide easy hooks)
     tokio::spawn(async move {
